@@ -1,0 +1,11 @@
+pandas
+numpy
+requests
+scikit-learn
+matplotlib
+geopandas
+folium
+libpysal
+esda
+mapclassify
+shapely
