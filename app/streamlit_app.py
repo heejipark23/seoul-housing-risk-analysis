@@ -838,7 +838,7 @@ def main() -> None:
     quality = data["quality"]
 
     # ── 헤더 ──
-    st.title("서울 청년·임차가구 생활권 이탈 위험 대시보드")
+    st.title("서울시 청년·저소득 임차가구의 생활권 이탈 위험지역 대시보드")
     st.markdown("<div class='title-gap'></div>", unsafe_allow_html=True)
 
     metric_label = "우선지원 위험도"
