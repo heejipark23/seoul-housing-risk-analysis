@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import base64
 from copy import deepcopy
+from html import escape
+from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import quote
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     from data_loader import load_all_data
@@ -20,6 +25,12 @@ ACCENT_RGB = (194, 65, 12)
 PALE_RGB = (250, 245, 241)
 GRAY_RGB = (226, 232, 240)
 DARK_RGB = (30, 41, 59)
+MAP_BLUE_COLORS = ["#E8EFFB", "#B4CEF6", "#4B84EC", "#0D5ACB", "#03142E"]
+MAP_MISSING_COLOR = "#CBD5E1"
+MAP_STROKE_COLOR = "rgba(13,90,203,0.28)"
+MAP_SELECTED_LABEL = "rgba(3,20,46,0.96)"
+MAP_LABEL = "rgba(30,41,59,0.92)"
+BACK_ICON_PATH = Path(__file__).resolve().parent / "assets" / "back.png"
 
 RISK_COLORS = {
     "강제잔류·압박형": "#C2410C",
@@ -34,6 +45,8 @@ SEOUL_MAP_METRICS = {
     "Top30 법정동수": ("Top30_법정동수", "개", "서울 Top30 우선지원 법정동 포함 수"),
     "주거비 관측 커버리지": ("주거비자료_커버리지", "%", "구 내 법정동 중 주거비 자료가 관측된 비율"),
 }
+
+PLOTLY_CONFIG = {"displayModeBar": False}
 
 GU_LABEL_OFFSETS = {
     "종로구": (-0.006, 0.002),
@@ -53,7 +66,6 @@ GU_LABEL_OFFSETS = {
 # ── 페이지 설정 ────────────────────────────────────────────
 st.set_page_config(
     page_title="서울 청년·임차가구 생활권 이탈 위험 대시보드",
-    page_icon="🏙️",
     layout="wide",
 )
 
@@ -62,6 +74,13 @@ st.set_page_config(
 @st.cache_data(show_spinner="데이터를 불러오는 중입니다...")
 def cached_data() -> dict[str, Any]:
     return load_all_data()
+
+
+@st.cache_data(show_spinner=False)
+def image_data_uri(path_text: str) -> str:
+    path = Path(path_text)
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
 
 
 # ── 유틸리티 함수 ──────────────────────────────────────────
@@ -88,6 +107,24 @@ def format_percent(value: Any, digits: int = 1) -> str:
     return f"{number * 100:.{digits}f}%"
 
 
+def display_top_dong_name(value: Any) -> str:
+    name = str(value)
+    if name == "양평동2가":
+        return "양평동 2가"
+    return name
+
+
+def render_back_link(icon_uri: str) -> None:
+    st.markdown(
+        f"""
+        <a class="back-icon-link" href="?back=1" target="_self" aria-label="서울 전체로 돌아가기">
+          <img src="{icon_uri}" alt="" />
+        </a>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def iter_lonlat(geometry: dict[str, Any]) -> Iterable[tuple[float, float]]:
     if geometry["type"] == "Polygon":
         for ring in geometry["coordinates"]:
@@ -108,26 +145,49 @@ def iter_rings(geometry: dict[str, Any]) -> Iterable[list[list[float]]]:
             yield from polygon
 
 
+def svg_path_from_geometry(
+    geometry: dict[str, Any],
+    min_lon: float,
+    max_lat: float,
+    scale: float,
+    padding: float,
+) -> str:
+    commands: list[str] = []
+    for ring in iter_rings(geometry):
+        if len(ring) < 3:
+            continue
+        points = [
+            (padding + (float(lon) - min_lon) * scale, padding + (max_lat - float(lat)) * scale)
+            for lon, lat in ring
+        ]
+        first_x, first_y = points[0]
+        path = [f"M {first_x:.1f} {first_y:.1f}"]
+        path.extend(f"L {x:.1f} {y:.1f}" for x, y in points[1:])
+        path.append("Z")
+        commands.append(" ".join(path))
+    return " ".join(commands)
+
+
 def color_from_range(value: Any, minimum: float, maximum: float) -> str:
     number = clean_number(value)
     if number is None:
-        return "rgba(226,232,240,0.9)"
+        return MAP_MISSING_COLOR
     if maximum <= minimum:
         ratio = 0.6
     else:
         ratio = max(0.0, min((number - minimum) / (maximum - minimum), 1.0))
-    rgb = [round(PALE_RGB[i] + (ACCENT_RGB[i] - PALE_RGB[i]) * ratio) for i in range(3)]
-    return f"rgba({rgb[0]},{rgb[1]},{rgb[2]},0.88)"
+    color_idx = min(int(ratio * len(MAP_BLUE_COLORS)), len(MAP_BLUE_COLORS) - 1)
+    return MAP_BLUE_COLORS[color_idx]
 
 
 def interpolate_color_hex(score: Any) -> str:
     """점수를 hex 색상으로 변환 (법정동 지도용)."""
     number = clean_number(score)
     if number is None:
-        return "#CBD5E1"
+        return MAP_MISSING_COLOR
     ratio = max(0.0, min(number / 100.0, 1.0))
-    rgb = [round(PALE_RGB[i] + (ACCENT_RGB[i] - PALE_RGB[i]) * ratio) for i in range(3)]
-    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+    color_idx = min(int(ratio * len(MAP_BLUE_COLORS)), len(MAP_BLUE_COLORS) - 1)
+    return MAP_BLUE_COLORS[color_idx]
 
 
 # ── 데이터 빌드 함수 ──────────────────────────────────────
@@ -152,6 +212,72 @@ def build_gu_summary(legal: pd.DataFrame) -> pd.DataFrame:
     return summary.sort_values("서울_위험도", ascending=False, na_position="last").reset_index(drop=True)
 
 
+def render_summary_cards(items: list[dict[str, str]]) -> None:
+    cards = "\n".join(
+        (
+            '<div class="summary-card">'
+            f'<div class="summary-label">{escape(item["label"])}</div>'
+            f'<div class="summary-value">{escape(item["value"])}</div>'
+            f'<div class="summary-caption">{escape(item.get("caption", ""))}</div>'
+            "</div>"
+        )
+        for item in items
+    )
+    st.markdown(f"<div class='summary-grid'>{cards}</div>", unsafe_allow_html=True)
+
+
+def render_glossary_group(title: str, items: list[dict[str, str]]) -> None:
+    terms = "\n".join(
+        (
+            '<div class="glossary-item">'
+            f'<div class="glossary-term">{escape(item["term"])}</div>'
+            f'<div class="glossary-desc">{escape(item["desc"])}</div>'
+            "</div>"
+        )
+        for item in items
+    )
+    st.markdown(
+        f"""
+        <div class="glossary-group">
+          <div class="glossary-title">{escape(title)}</div>
+          {terms}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_risk_type_glossary() -> None:
+    risk_descriptions = {
+        "강제잔류·압박형": "취약계층 밀집도와 주거비 압박이 모두 높아, 이탈도 어렵고 부담도 큰 최우선 위험 유형입니다.",
+        "이탈진행형": "주거비 압박은 높지만 취약계층 밀집도는 낮아, 기존 취약계층이 이미 밀려났을 가능성이 있는 유형입니다.",
+        "잠재위험형": "취약계층 밀집도는 높지만 현재 주거비 압박은 상대적으로 낮아, 선제 모니터링이 필요한 유형입니다.",
+        "안정형": "두 지표가 모두 상대적으로 낮아 현재 위험 신호가 약한 유형입니다.",
+        "자료없음": "주거비 등 일부 핵심 자료가 부족해 위험유형을 판단하기 어려운 지역입니다.",
+    }
+    rows = "\n".join(
+        (
+            '<div class="risk-term">'
+            f'<span class="legend-dot" style="background:{color}"></span>'
+            '<div>'
+            f'<div class="glossary-term">{escape(risk)}</div>'
+            f'<div class="glossary-desc">{escape(risk_descriptions[risk])}</div>'
+            "</div>"
+            "</div>"
+        )
+        for risk, color in RISK_COLORS.items()
+    )
+    st.markdown(
+        f"""
+        <div class="glossary-group">
+          <div class="glossary-title">위험유형</div>
+          {rows}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # ── 지도 렌더링: 서울 전체 (자치구 레벨) ────────────────────
 def render_seoul_gu_map(
     geojson: dict[str, Any],
@@ -159,10 +285,10 @@ def render_seoul_gu_map(
     selected_gu: str | None,
     metric_label: str,
 ) -> str | None:
-    """서울 전체 자치구 지도를 Plotly로 렌더링. 클릭된 자치구 이름 반환."""
+    """서울 전체 자치구 지도를 클릭 가능한 정적 SVG로 렌더링."""
 
     summary = build_gu_summary(legal)
-    metric_col, unit, description = SEOUL_MAP_METRICS[metric_label]
+    metric_col, unit, _description = SEOUL_MAP_METRICS[metric_label]
     value_by_gu = summary.set_index("시군구명")[metric_col].to_dict()
     summary_by_gu = summary.set_index("시군구명").to_dict("index")
     legal_by_code8 = legal.set_index("법정동코드8").to_dict("index")
@@ -171,8 +297,22 @@ def render_seoul_gu_map(
     minimum = min(clean_values) if clean_values else 0
     maximum = max(clean_values) if clean_values else 1
 
-    fig = go.Figure()
+    all_points = [point for feature in geojson["features"] for point in iter_lonlat(feature["geometry"])]
+    if not all_points:
+        st.info("지도 경계 데이터를 불러오지 못했습니다.")
+        return None
+
+    min_lon = min(point[0] for point in all_points)
+    max_lon = max(point[0] for point in all_points)
+    min_lat = min(point[1] for point in all_points)
+    max_lat = max(point[1] for point in all_points)
+    padding = 34.0
+    svg_width = 920.0
+    scale = (svg_width - padding * 2) / max(max_lon - min_lon, 0.001)
+    svg_height = (max_lat - min_lat) * scale + padding * 2
+
     label_points: dict[str, list[tuple[float, float]]] = {}
+    paths: list[str] = []
 
     for feature in geojson["features"]:
         row = legal_by_code8.get(str(feature["properties"]["EMD_CD"]))
@@ -181,20 +321,13 @@ def render_seoul_gu_map(
         gu = str(row["시군구명"])
         color = color_from_range(value_by_gu.get(gu), minimum, maximum)
         label_points.setdefault(gu, []).extend(iter_lonlat(feature["geometry"]))
-        for ring in iter_rings(feature["geometry"]):
-            if len(ring) < 3:
-                continue
-            xs = [pt[0] for pt in ring]
-            ys = [pt[1] for pt in ring]
-            fig.add_trace(
-                go.Scatter(
-                    x=xs, y=ys, mode="lines", fill="toself",
-                    fillcolor=color, line=dict(color=color, width=0.6),
-                    hoverinfo="skip", showlegend=False,
-                )
+        path_data = svg_path_from_geometry(feature["geometry"], min_lon, max_lat, scale, padding)
+        if path_data:
+            paths.append(
+                f'<path class="gu-shape" d="{path_data}" fill="{color}" stroke="{MAP_STROKE_COLOR}" />'
             )
 
-    hover_x, hover_y, hover_gu, hover_text = [], [], [], []
+    labels: list[str] = []
     for gu, points in label_points.items():
         if not points:
             continue
@@ -203,6 +336,8 @@ def render_seoul_gu_map(
         dx, dy = GU_LABEL_OFFSETS.get(gu, (0.0, 0.0))
         lon += dx
         lat += dy
+        x = padding + (lon - min_lon) * scale
+        y = padding + (max_lat - lat) * scale
         item = summary_by_gu.get(gu, {})
         value = clean_number(item.get(metric_col))
         if unit == "%":
@@ -213,61 +348,77 @@ def render_seoul_gu_map(
             value_text = f"{int(value):,}{unit}" if value is not None else "자료 없음"
 
         is_selected = gu == selected_gu
-        fig.add_annotation(
-            x=lon, y=lat,
-            text=f"<b>{gu}</b><br>{value_text}",
-            showarrow=False,
-            font=dict(color="white", size=13 if is_selected else 12),
-            bgcolor="rgba(124,45,18,0.94)" if is_selected else "rgba(71,67,73,0.88)",
-            bordercolor="rgba(15,23,42,0.92)" if is_selected else "rgba(71,67,73,0.88)",
-            borderpad=5, opacity=0.96,
-        )
-        hover_x.append(lon)
-        hover_y.append(lat)
-        hover_gu.append(gu)
-        hover_text.append(
-            f"<b>{gu}</b><br>"
-            f"{description}: {value_text}<br>"
-            f"대표 법정동: {item.get('대표법정동', '-')}<br>"
-            f"최고점수: {format_score(item.get('최고점수'))}<br>"
-            f"Top30: {int(item.get('Top30_법정동수', 0))}개<br>"
-            f"주거비 관측: {format_percent(item.get('주거비자료_커버리지'))}"
+        label_color = MAP_SELECTED_LABEL if is_selected else MAP_LABEL
+        href = f"/?drill_gu={quote(gu)}"
+        left = x / svg_width * 100
+        top = y / svg_height * 100
+        labels.append(
+            f'<a class="gu-label-link" href="{href}" target="_self" aria-label="{escape(gu)} 법정동 상세 보기" '
+            f'style="left:{left:.3f}%; top:{top:.3f}%; background:{label_color};">'
+            f'<span class="gu-name">{escape(gu)}</span>'
+            f'<span class="gu-value">{escape(value_text)}</span>'
+            "</a>"
         )
 
-    fig.add_trace(
-        go.Scatter(
-            x=hover_x, y=hover_y, mode="markers",
-            marker=dict(size=66, color="rgba(71,67,73,0.01)"),
-            customdata=hover_gu, hovertext=hover_text,
-            hoverinfo="text", showlegend=False,
-        )
-    )
-    fig.update_layout(
-        height=620,
-        margin=dict(l=0, r=0, t=8, b=0),
-        paper_bgcolor="white", plot_bgcolor="white",
-        xaxis=dict(visible=False, constrain="domain"),
-        yaxis=dict(visible=False, scaleanchor="x", scaleratio=1),
-    )
-
-    event = st.plotly_chart(
-        fig, use_container_width=True,
-        key="seoul-gu-click-map", on_select="rerun",
-        selection_mode="points", config={"displayModeBar": False},
-    )
-
-    # 클릭 이벤트 처리
-    selection = getattr(event, "selection", None) if event else None
-    if selection is None and isinstance(event, dict):
-        selection = event.get("selection")
-    points = (selection.get("points", []) if isinstance(selection, dict)
-              else getattr(selection, "points", []))
-    if points:
-        pt = points[0]
-        if isinstance(pt, dict):
-            cd = pt.get("customdata")
-            if isinstance(cd, str):
-                return cd
+    html = f"""
+    <!-- dong-map-component-v2 -->
+    <style>
+      .seoul-map-wrap {{
+        position: relative;
+        width: 100%;
+        background: white;
+      }}
+      .seoul-svg {{
+        width: 100%;
+        height: auto;
+        display: block;
+        background: white;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }}
+      .gu-shape {{
+        stroke-width: 0.75;
+        vector-effect: non-scaling-stroke;
+        pointer-events: none;
+      }}
+      .gu-label-link {{
+        position: absolute;
+        width: 64px;
+        min-height: 44px;
+        transform: translate(-50%, -50%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        color: white !important;
+        text-decoration: none !important;
+        border: 1px solid rgba(15,23,42,0.62);
+        box-sizing: border-box;
+        cursor: pointer;
+        line-height: 1.15;
+        transition: filter 120ms ease, opacity 120ms ease;
+      }}
+      .gu-label-link:hover {{
+        color: white !important;
+        filter: brightness(1.08);
+        opacity: 0.96;
+      }}
+      .gu-name {{
+        font-size: 13px;
+        font-weight: 800;
+      }}
+      .gu-value {{
+        font-size: 12px;
+        font-weight: 650;
+      }}
+    </style>
+    <div class="seoul-map-wrap">
+      <svg class="seoul-svg" viewBox="0 0 {svg_width:.1f} {svg_height:.1f}" role="img" aria-label="서울 전체 자치구 지도">
+        <g>{''.join(paths)}</g>
+      </svg>
+      {''.join(labels)}
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
     return None
 
 
@@ -276,14 +427,39 @@ def render_gu_dong_map(
     geojson: dict[str, Any],
     legal: pd.DataFrame,
     gu: str,
+    initial_zoom: float = 1.0,
+    initial_scroll_x: float = 0.0,
+    initial_scroll_y: float = 0.0,
 ) -> str | None:
-    """선택한 자치구의 법정동 지도를 Plotly로 렌더링. 클릭된 법정동코드 반환."""
+    """선택한 자치구의 법정동 지도를 클릭 가능한 정적 SVG로 렌더링."""
 
     legal_by_code8 = legal.set_index("법정동코드8").to_dict("index")
     gu_legal = legal.loc[legal["시군구명"].eq(gu)]
 
-    fig = go.Figure()
+    all_points = []
+    for feature in geojson["features"]:
+        row = legal_by_code8.get(str(feature["properties"]["EMD_CD"]))
+        if row and str(row["시군구명"]) == gu:
+            all_points.extend(iter_lonlat(feature["geometry"]))
+    if not all_points:
+        st.info("이 자치구의 지도 경계 데이터를 불러오지 못했습니다.")
+        return None
+
+    min_lon = min(point[0] for point in all_points)
+    max_lon = max(point[0] for point in all_points)
+    min_lat = min(point[1] for point in all_points)
+    max_lat = max(point[1] for point in all_points)
+    padding = 36.0
+    svg_width = 920.0
+    scale = min(
+        (svg_width - padding * 2) / max(max_lon - min_lon, 0.001),
+        560.0 / max(max_lat - min_lat, 0.001),
+    )
+    svg_height = (max_lat - min_lat) * scale + padding * 2
+
+    paths: list[str] = []
     dong_centers: dict[str, dict] = {}
+    selected_code = st.session_state.get("selected_dong_code")
 
     for feature in geojson["features"]:
         code8 = str(feature["properties"]["EMD_CD"])
@@ -294,8 +470,7 @@ def render_gu_dong_map(
         score = clean_number(row.get("우선지원점수"))
         fill_color = interpolate_color_hex(score)
         legal_code = str(row["법정동코드"])
-        dong_name = str(row.get("표시명") or row.get("법정동명"))
-        risk_type = str(row.get("위험유형") or "자료없음")
+        dong_name = str(row.get("법정동명") or row.get("표시명"))
 
         pts = list(iter_lonlat(feature["geometry"]))
         if pts:
@@ -304,98 +479,132 @@ def render_gu_dong_map(
             if legal_code not in dong_centers:
                 dong_centers[legal_code] = {
                     "lon": cx, "lat": cy, "name": dong_name,
-                    "score": score, "risk": risk_type, "code": legal_code,
-                    "rank": "-" if pd.isna(row.get("우선지원순위")) else str(int(row.get("우선지원순위"))),
+                    "score": score, "code": legal_code,
                 }
 
-        for ring in iter_rings(feature["geometry"]):
-            if len(ring) < 3:
-                continue
-            xs = [p[0] for p in ring]
-            ys = [p[1] for p in ring]
-            fig.add_trace(
-                go.Scatter(
-                    x=xs, y=ys, mode="lines", fill="toself",
-                    fillcolor=fill_color,
-                    line=dict(color="white", width=0.8),
-                    hoverinfo="skip", showlegend=False,
-                )
+        path_data = svg_path_from_geometry(feature["geometry"], min_lon, max_lat, scale, padding)
+        if path_data:
+            paths.append(
+                f'<path class="dong-shape" d="{path_data}" fill="{fill_color}" />'
             )
 
-    # 법정동 라벨 & 클릭용 invisible markers
-    click_x, click_y, click_codes, click_texts = [], [], [], []
+    labels: list[str] = []
     for code, info in dong_centers.items():
-        score_txt = format_score(info["score"])
-        fig.add_annotation(
-            x=info["lon"], y=info["lat"],
-            text=f"<b>{info['name']}</b>",
-            showarrow=False,
-            font=dict(color="#1E293B", size=9),
-            bgcolor="rgba(255,255,255,0.7)",
-            borderpad=2, opacity=0.95,
-        )
-        click_x.append(info["lon"])
-        click_y.append(info["lat"])
-        click_codes.append(info["code"])
-        click_texts.append(
-            f"<b>{info['name']}</b><br>"
-            f"우선지원 점수: {score_txt}<br>"
-            f"순위: {info['rank']}<br>"
-            f"위험유형: {info['risk']}"
+        x = padding + (info["lon"] - min_lon) * scale
+        y = padding + (max_lat - info["lat"]) * scale
+        left = x / svg_width * 100
+        top = y / svg_height * 100
+        label_color = MAP_SELECTED_LABEL if code == selected_code else MAP_LABEL
+        labels.append(
+            f'<div class="dong-label" aria-label="{escape(info["name"])}" '
+            f'style="left:{left:.3f}%; top:{top:.3f}%; background:{label_color};">'
+            f'{escape(info["name"])}</div>'
         )
 
-    fig.add_trace(
-        go.Scatter(
-            x=click_x, y=click_y, mode="markers",
-            marker=dict(size=30, color="rgba(0,0,0,0.01)"),
-            customdata=click_codes, hovertext=click_texts,
-            hoverinfo="text", showlegend=False,
-        )
-    )
+    min_zoom = 1.0
+    max_zoom = 3.0
+    zoom = max(min_zoom, min(initial_zoom, max_zoom))
+    scroll_height = min(640, max(420, int(svg_height + 18)))
+    component_height = min(660, max(440, int(svg_height + 38)))
 
-    # 뷰포트 계산
-    all_pts = []
-    for feature in geojson["features"]:
-        row = legal_by_code8.get(str(feature["properties"]["EMD_CD"]))
-        if row and str(row["시군구명"]) == gu:
-            all_pts.extend(iter_lonlat(feature["geometry"]))
-    if all_pts:
-        lons = [p[0] for p in all_pts]
-        lats = [p[1] for p in all_pts]
-        x_range = [min(lons) - 0.003, max(lons) + 0.003]
-        y_range = [min(lats) - 0.002, max(lats) + 0.002]
-    else:
-        x_range, y_range = None, None
-
-    layout_kwargs = dict(
-        height=580,
-        margin=dict(l=0, r=0, t=8, b=0),
-        paper_bgcolor="white", plot_bgcolor="white",
-        xaxis=dict(visible=False, constrain="domain"),
-        yaxis=dict(visible=False, scaleanchor="x", scaleratio=1),
-    )
-    if x_range:
-        layout_kwargs["xaxis"]["range"] = x_range
-        layout_kwargs["yaxis"]["range"] = y_range
-    fig.update_layout(**layout_kwargs)
-
-    event = st.plotly_chart(
-        fig, use_container_width=True,
-        key=f"dong-map-{gu}", on_select="rerun",
-        selection_mode="points", config={"displayModeBar": False},
-    )
-
-    selection = getattr(event, "selection", None) if event else None
-    if selection is None and isinstance(event, dict):
-        selection = event.get("selection")
-    points = (selection.get("points", []) if isinstance(selection, dict)
-              else getattr(selection, "points", []))
-    if points:
-        pt = points[0]
-        if isinstance(pt, dict):
-            cd = pt.get("customdata")
-            if isinstance(cd, str):
-                return cd
+    html = f"""
+    <style>
+      html, body {{
+        margin: 0;
+        padding: 0;
+        background: white;
+        overflow: hidden;
+      }}
+      .dong-map-scroll {{
+        height: {scroll_height}px;
+        overflow: auto;
+        background: white;
+        border: 1px solid #E2E8F0;
+        border-radius: 8px;
+        overscroll-behavior: contain;
+      }}
+      .dong-map-wrap {{
+        position: relative;
+        width: min(100%, {svg_width:.1f}px);
+        margin: 0 auto;
+        background: white;
+      }}
+      .dong-svg {{
+        width: 100%;
+        height: auto;
+        display: block;
+        background: white;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }}
+      .dong-shape {{
+        stroke: white;
+        stroke-width: 0.85;
+        vector-effect: non-scaling-stroke;
+        pointer-events: none;
+      }}
+      .dong-label {{
+        position: absolute;
+        min-width: 50px;
+        max-width: 96px;
+        transform: translate(-50%, -50%);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: white !important;
+        text-decoration: none !important;
+        border: 1px solid rgba(15,23,42,0.62);
+        box-sizing: border-box;
+        line-height: 1.12;
+        padding: 3px 5px;
+        font-size: 10px;
+        font-weight: 800;
+        text-align: center;
+        word-break: keep-all;
+      }}
+    </style>
+    <div class="dong-map-scroll" id="dong-map-scroll">
+      <div class="dong-map-wrap">
+        <svg class="dong-svg" viewBox="0 0 {svg_width:.1f} {svg_height:.1f}" role="img" aria-label="{escape(gu)} 법정동 지도">
+          <g>{''.join(paths)}</g>
+        </svg>
+        {''.join(labels)}
+      </div>
+    </div>
+    <script>
+      const box = document.getElementById("dong-map-scroll");
+      const map = box.querySelector(".dong-map-wrap");
+      const nativeWidth = {svg_width:.1f};
+      const minZoom = {min_zoom:.1f};
+      const maxZoom = {max_zoom:.1f};
+      let zoom = {zoom:.3f};
+      let fitWidth = Math.min(box.clientWidth, nativeWidth);
+      map.style.width = `${{fitWidth * zoom}}px`;
+      map.style.maxWidth = "none";
+      box.scrollLeft = {max(0.0, initial_scroll_x):.1f};
+      box.scrollTop = {max(0.0, initial_scroll_y):.1f};
+      box.addEventListener("wheel", (event) => {{
+        if (!event.ctrlKey) return;
+        event.preventDefault();
+        const oldZoom = zoom;
+        zoom = Math.min(maxZoom, Math.max(minZoom, zoom * (event.deltaY < 0 ? 1.12 : 0.89)));
+        const rect = box.getBoundingClientRect();
+        const pointerX = event.clientX - rect.left;
+        const pointerY = event.clientY - rect.top;
+        const contentX = box.scrollLeft + pointerX;
+        const contentY = box.scrollTop + pointerY;
+        const ratio = zoom / oldZoom;
+        map.style.width = `${{fitWidth * zoom}}px`;
+        box.scrollLeft = contentX * ratio - pointerX;
+        box.scrollTop = contentY * ratio - pointerY;
+      }}, {{ passive: false }});
+      window.addEventListener("resize", () => {{
+        if (zoom !== minZoom) return;
+        fitWidth = Math.min(box.clientWidth, nativeWidth);
+        map.style.width = `${{fitWidth}}px`;
+      }});
+    </script>
+    """
+    components.html(html, height=component_height, scrolling=False)
     return None
 
 
@@ -419,7 +628,7 @@ def render_legal_detail_card(row: pd.Series, rent: pd.DataFrame) -> None:
         )
 
     # 탭으로 세부정보 분리
-    tab_indicator, tab_rent = st.tabs(["📊 세부 지표", "📈 전월세 상승률"])
+    tab_indicator, tab_rent = st.tabs(["세부 지표", "전월세 상승률"])
 
     with tab_indicator:
         detail = pd.DataFrame([
@@ -448,7 +657,7 @@ def render_legal_detail_card(row: pd.Series, rent: pd.DataFrame) -> None:
                 height=280, margin=dict(l=8, r=8, t=18, b=8),
                 showlegend=False, yaxis_title="상승률(%)", xaxis_title="",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
 
 # ── 정책 브릿지 카드 ──────────────────────────────────────
@@ -483,12 +692,15 @@ def render_policy_reason(admin_row: pd.Series, linked_legal: pd.DataFrame) -> No
 
 # ── 메인 ──────────────────────────────────────────────────
 def main() -> None:
+    back_icon_uri = image_data_uri(str(BACK_ICON_PATH))
+
     # ── 커스텀 스타일 ──
     st.markdown(
         """
         <style>
         .block-container { padding-top: 1.2rem; }
         h1 { letter-spacing: 0; font-size: 2.3rem; line-height: 1.16; }
+        .title-gap { height: 1.25rem; }
         .chip {
             display: inline-block;
             padding: 0.2rem 0.55rem;
@@ -507,20 +719,114 @@ def main() -> None:
         }
         .reason-title { font-weight: 700; color: #7C2D12; margin-bottom: 0.35rem; }
         .note { color: #64748B; font-size: 0.88rem; margin-bottom: 0; }
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 0.75rem;
+            align-items: stretch;
+        }
+        .summary-card {
+            min-height: 118px;
+            background: #FFFFFF;
+            border: 1px solid #E2E8F0;
+            border-radius: 8px;
+            padding: 0.9rem 1rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            min-width: 0;
+        }
+        .summary-label {
+            color: #475569;
+            font-size: 0.82rem;
+            font-weight: 650;
+            line-height: 1.25;
+        }
+        .summary-value {
+            color: #0F172A;
+            font-size: 1.36rem;
+            font-weight: 760;
+            line-height: 1.15;
+            overflow-wrap: anywhere;
+            word-break: keep-all;
+        }
+        .summary-caption {
+            color: #64748B;
+            font-size: 0.8rem;
+            line-height: 1.25;
+            min-height: 1.05rem;
+            overflow-wrap: anywhere;
+        }
+        @media (max-width: 1200px) {
+            .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+        @media (max-width: 720px) {
+            .summary-grid { grid-template-columns: 1fr; }
+        }
         div[data-testid="stMetric"] {
             background: #FFFFFF;
             border: 1px solid #E2E8F0;
             padding: 0.8rem;
             border-radius: 8px;
         }
-        .back-btn-area { margin-bottom: 0.4rem; }
-        /* 사이드바 리스크 범례 */
-        .legend-item {
-            display: flex; align-items: center; gap: 0.4rem;
-            margin-bottom: 0.3rem; font-size: 0.85rem;
+        .back-icon-link {
+            width: 42px;
+            height: 42px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            text-decoration: none;
+            border: none;
+            background: transparent;
+            margin-top: 0.2rem;
+        }
+        .back-icon-link:hover {
+            background: #F8FAFC;
+            border-radius: 8px;
+        }
+        .back-icon-link img {
+            width: 30px;
+            height: 30px;
+            display: block;
+            object-fit: contain;
+        }
+        .glossary-group {
+            border-top: 1px solid #CBD5E1;
+            padding-top: 1rem;
+            margin-top: 1rem;
+        }
+        .glossary-title {
+            color: #0F172A;
+            font-size: 0.98rem;
+            font-weight: 800;
+            margin-bottom: 0.72rem;
+        }
+        .glossary-item {
+            margin-bottom: 0.82rem;
+        }
+        .glossary-term {
+            color: #1E293B;
+            font-size: 0.88rem;
+            font-weight: 750;
+            line-height: 1.28;
+        }
+        .glossary-desc {
+            color: #64748B;
+            font-size: 0.79rem;
+            line-height: 1.42;
+            margin-top: 0.14rem;
+            word-break: keep-all;
+        }
+        .risk-term {
+            display: grid;
+            grid-template-columns: 12px 1fr;
+            gap: 0.55rem;
+            align-items: start;
+            margin-bottom: 0.86rem;
         }
         .legend-dot {
             width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0;
+            margin-top: 0.18rem;
         }
         </style>
         """,
@@ -532,39 +838,90 @@ def main() -> None:
     quality = data["quality"]
 
     # ── 헤더 ──
-    st.title("🏙️ 서울 청년·임차가구 생활권 이탈 위험 대시보드")
-    st.caption("법정동 분석 → 행정동 정책 번역 | 자치구를 클릭하면 법정동 상세 지도로 진입합니다")
+    st.title("서울 청년·임차가구 생활권 이탈 위험 대시보드")
+    st.markdown("<div class='title-gap'></div>", unsafe_allow_html=True)
+
+    metric_label = "우선지원 위험도"
 
     # ── 사이드바 ──
     with st.sidebar:
-        st.header("🔎 탐색 조건")
+        st.header("📘 용어 설명")
+        st.caption("대시보드에서 자주 쓰는 지표와 유형을 간단히 정리했습니다.")
 
-        metric_label = st.selectbox(
-            "서울 지도 지표",
-            list(SEOUL_MAP_METRICS.keys()),
-            help="서울 지도에서 자치구별로 표시할 핵심 수치를 선택합니다.",
+        render_glossary_group(
+            "핵심 지표",
+            [
+                {
+                    "term": "우선지원 점수",
+                    "desc": "취약계층 밀집도, 주거비 압박, 공공임대 여건을 결합해 산출한 최종 우선순위 점수입니다. 높을수록 정책 검토 우선도가 높습니다.",
+                },
+                {
+                    "term": "취약계층 밀집도(CI)",
+                    "desc": "청년비율, 1인가구비율, 기초수급가구비율을 정규화해 합친 지표입니다. 청년·저소득 주거취약 계층이 상대적으로 많이 모인 정도를 뜻합니다.",
+                },
+                {
+                    "term": "주거비 압박지수",
+                    "desc": "전월세 상승률과 임대료 수준을 반영해 주거비 부담이 커지는 정도를 나타낸 지표입니다.",
+                },
+                {
+                    "term": "공공임대 보정",
+                    "desc": "공공임대 접근성이 상대적으로 좋은 지역은 최종 위험도를 일부 낮춰 반영한 조정값입니다.",
+                },
+            ],
         )
 
-        st.divider()
-        st.markdown("**위험유형 범례**")
-        for risk, color in RISK_COLORS.items():
-            st.markdown(
-                f"<div class='legend-item'><div class='legend-dot' style='background:{color}'></div>{risk}</div>",
-                unsafe_allow_html=True,
-            )
+        render_risk_type_glossary()
 
-        st.divider()
-        st.caption("색상은 우선지원 점수 기준입니다. 진할수록 위험도가 높습니다.")
+        render_glossary_group(
+            "공간·정책 단위",
+            [
+                {
+                    "term": "법정동 분석",
+                    "desc": "주거비와 취약계층 밀집도를 세밀하게 보기 위해 법정동 단위로 위험도를 계산한 화면입니다.",
+                },
+                {
+                    "term": "행정동 정책 브릿지",
+                    "desc": "법정동 분석 결과를 실제 정책 집행 단위인 행정동으로 연결해 보여주는 화면입니다.",
+                },
+                {
+                    "term": "Top30",
+                    "desc": "서울시 법정동 중 최종 우선지원 점수가 높은 상위 30개 후보 지역입니다.",
+                },
+                {
+                    "term": "핫스팟",
+                    "desc": "해당 지역뿐 아니라 주변 지역까지 위험도가 함께 높은 공간적 군집 지역입니다.",
+                },
+            ],
+        )
+
+        render_glossary_group(
+            "지도 읽기",
+            [
+                {
+                    "term": "지도 색상",
+                    "desc": "색이 진할수록 우선지원 점수 또는 선택한 위험 신호가 상대적으로 높습니다.",
+                },
+                {
+                    "term": "자료없음",
+                    "desc": "해당 법정동에 주거비 자료 등 필수 데이터가 부족해 일부 지표가 계산되지 않은 경우입니다.",
+                },
+            ],
+        )
 
     # ── 상단 핵심 요약 (접을 수 있는 지표) ──
     with st.expander("📋 전체 분석 요약 지표", expanded=False):
         top = legal.sort_values("우선지원순위").head(1).iloc[0]
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("법정동 분석 단위", f"{quality['법정동수']:,}개")
-        c2.metric("행정동 정책 단위", f"{quality['행정동수']:,}개")
-        c3.metric("연결쌍", f"{quality['연결쌍수']:,}개")
-        c4.metric("다중 행정동 법정동", f"{quality['다중행정동_법정동수']:,}개")
-        c5.metric("최우선 후보", "1위", f"{top['법정동명']} · {format_score(top['우선지원점수'])}점")
+        render_summary_cards([
+            {"label": "법정동 분석 단위", "value": f"{quality['법정동수']:,}개", "caption": "위험 분석 대상"},
+            {"label": "행정동 정책 단위", "value": f"{quality['행정동수']:,}개", "caption": "집행 단위"},
+            {"label": "연결쌍", "value": f"{quality['연결쌍수']:,}개", "caption": "법정동-행정동 매핑"},
+            {"label": "다중 행정동 법정동", "value": f"{quality['다중행정동_법정동수']:,}개", "caption": "분할 매핑 대상"},
+            {
+                "label": "최우선 후보",
+                "value": display_top_dong_name(top["법정동명"]),
+                "caption": f"{top['시군구명']} · {format_score(top['우선지원점수'])}점",
+            },
+        ])
         if quality["Top30_매핑누락수"]:
             st.warning(f"Top30 법정동 중 행정동 매핑 누락이 {quality['Top30_매핑누락수']}개 있습니다.")
 
@@ -575,6 +932,27 @@ def main() -> None:
     if "selected_dong_code" not in st.session_state:
         st.session_state["selected_dong_code"] = None
 
+    if st.query_params.get("back") == "1":
+        st.session_state["drill_gu"] = None
+        st.session_state["selected_dong_code"] = None
+        st.session_state["_last_map_query"] = None
+        st.query_params.clear()
+
+    query_drill_gu = st.query_params.get("drill_gu")
+    query_dong_code = st.query_params.get("selected_dong_code")
+    query_signature = (query_drill_gu, query_dong_code)
+    if query_drill_gu in gu_list and query_signature != st.session_state.get("_last_map_query"):
+        st.session_state["drill_gu"] = query_drill_gu
+        query_gu_codes = set(
+            legal.loc[legal["시군구명"].eq(query_drill_gu), "법정동코드"].astype(str)
+        )
+        if query_dong_code in query_gu_codes:
+            st.session_state["selected_dong_code"] = query_dong_code
+            st.session_state["_selected_from_query"] = True
+        else:
+            st.session_state["selected_dong_code"] = None
+        st.session_state["_last_map_query"] = query_signature
+
     drill_gu = st.session_state["drill_gu"]
 
     # ─────────────────────────────────────────────────────
@@ -583,13 +961,9 @@ def main() -> None:
     if drill_gu is None:
         # ── 서울 전체 자치구 지도 ──
         st.subheader("서울 전체 자치구 지도")
-        st.caption("자치구 버블을 클릭하면 해당 자치구의 법정동 상세 지도로 이동합니다.")
+        st.caption("자치구를 클릭하면 해당 자치구의 법정동 상세 지도로 이동합니다.")
 
-        clicked_gu = render_seoul_gu_map(data["geojson"], legal, None, metric_label)
-        if clicked_gu and clicked_gu in gu_list:
-            st.session_state["drill_gu"] = clicked_gu
-            st.session_state["selected_dong_code"] = None
-            st.rerun()
+        render_seoul_gu_map(data["geojson"], legal, None, metric_label)
 
         # ── 자치구 비교 테이블 ──
         with st.expander("📊 자치구별 비교 테이블", expanded=False):
@@ -607,14 +981,11 @@ def main() -> None:
         gu_legal = legal.loc[legal["시군구명"].eq(gu)].copy()
 
         # 뒤로가기 버튼
-        col_back, col_title = st.columns([1, 5])
+        col_back, col_title = st.columns([0.32, 6])
         with col_back:
-            if st.button("← 서울 전체로", use_container_width=True):
-                st.session_state["drill_gu"] = None
-                st.session_state["selected_dong_code"] = None
-                st.rerun()
+            render_back_link(back_icon_uri)
         with col_title:
-            st.subheader(f"📍 {gu} 법정동 상세")
+            st.subheader(f"{gu} 법정동")
 
         # 자치구 요약 지표
         mc1, mc2, mc3, mc4 = st.columns(4)
@@ -624,10 +995,16 @@ def main() -> None:
         mc4.metric("주거비 관측", f"{int(gu_legal['관측품질'].eq('주거비관측').sum()):,}개")
 
         # ── 법정동 지도 ──
-        st.caption("법정동을 클릭하면 아래에 상세 정보가 표시됩니다. 색이 진할수록 우선지원 점수가 높습니다.")
-        clicked_dong = render_gu_dong_map(data["geojson"], legal, gu)
-        if clicked_dong and clicked_dong in set(gu_legal["법정동코드"]):
-            st.session_state["selected_dong_code"] = clicked_dong
+        st.markdown('<div id="dong-map-area"></div>', unsafe_allow_html=True)
+        st.caption("지도 위에서 Ctrl+스크롤로 확대/축소할 수 있습니다.")
+        render_gu_dong_map(
+            data["geojson"],
+            legal,
+            gu,
+            1.0,
+            0.0,
+            0.0,
+        )
 
         # ── 탭: 법정동 분석 / 행정동 브릿지 / 위험유형 분포 ──
         tab_dong, tab_admin, tab_chart = st.tabs([
@@ -642,11 +1019,22 @@ def main() -> None:
             )["법정동코드"].tolist()
             labels = dict(zip(gu_legal["법정동코드"], gu_legal["표시명"]))
 
-            selected_code = st.session_state.get("selected_dong_code")
-            if not selected_code or selected_code not in set(gu_legal["법정동코드"]):
-                selected_code = options[0] if options else None
-
             if options:
+                selected_from_query = st.session_state.pop("_selected_from_query", False)
+                selected_code = st.session_state.get("selected_dong_code")
+                widget_code = st.session_state.get("dong-select")
+
+                if selected_from_query and selected_code in options:
+                    st.session_state["dong-select"] = selected_code
+                elif widget_code in options:
+                    selected_code = widget_code
+                    st.session_state["selected_dong_code"] = selected_code
+                else:
+                    if selected_code not in options:
+                        selected_code = options[0]
+                    st.session_state["selected_dong_code"] = selected_code
+                    st.session_state["dong-select"] = selected_code
+
                 selected_code = st.selectbox(
                     "법정동 선택",
                     options=options,
@@ -728,13 +1116,20 @@ def main() -> None:
             if scatter.empty:
                 st.info("이 자치구에는 주거비 압박지수와 CI가 모두 관측된 법정동이 없습니다.")
             else:
+                scatter["차트_점크기"] = scatter["우선지원점수"].clip(lower=0).fillna(0)
                 fig = px.scatter(
                     scatter,
                     x="concentration_index", y="주거비_압박지수",
-                    size="우선지원점수", color="위험유형",
+                    size="차트_점크기", color="위험유형",
+                    size_max=28,
                     color_discrete_map=RISK_COLORS,
                     hover_name="표시명",
-                    hover_data=["우선지원점수", "우선지원순위", "관측품질"],
+                    hover_data={
+                        "우선지원점수": ":.1f",
+                        "우선지원순위": True,
+                        "관측품질": True,
+                        "차트_점크기": False,
+                    },
                 )
                 fig.update_layout(
                     height=420,
@@ -742,7 +1137,7 @@ def main() -> None:
                     xaxis_title="취약계층 밀집도 (CI)",
                     yaxis_title="주거비 압박지수",
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
             # 위험유형 비율 파이차트
             risk_dist = gu_legal["위험유형"].value_counts()
@@ -758,7 +1153,7 @@ def main() -> None:
                     title=f"{gu} 위험유형 분포",
                     showlegend=False,
                 )
-                st.plotly_chart(fig_pie, use_container_width=True)
+                st.plotly_chart(fig_pie, use_container_width=True, config=PLOTLY_CONFIG)
 
 
 if __name__ == "__main__":
