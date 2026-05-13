@@ -6,11 +6,17 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from matplotlib.collections import PatchCollection
-from matplotlib.colors import Normalize
+from matplotlib.colors import ListedColormap, Normalize
 from matplotlib.patches import Patch, Polygon as MplPolygon
 
 from .config import FIGURE_DIR, PROJECT_ROOT
 from .spatial import geometry_rings
+
+
+BLUE_5_CMAP = ListedColormap(
+    ["#E8EFFB", "#B4CEF6", "#4B84EC", "#0D5ACB", "#03142E"],
+    name="presentation_blue_5",
+)
 
 
 def make_polygon_patches(feature: dict) -> list[MplPolygon]:
@@ -41,7 +47,7 @@ def plot_choropleth(
     value_col: str,
     title: str,
     output_path: Path,
-    cmap: str = "viridis",
+    cmap: str | ListedColormap = "viridis",
 ) -> None:
     value_by_code = df.set_index("법정동코드8")[value_col].astype(float).to_dict()
     patches = []
@@ -145,7 +151,7 @@ def create_all_maps(df: pd.DataFrame, geojson: dict) -> None:
         "concentration_index",
         "서울 청년·저소득·임차가구 밀집지수(CI)",
         FIGURE_DIR / "choropleth_concentration_index.png",
-        cmap="magma_r",
+        cmap=BLUE_5_CMAP,
     )
 
     lisa_colors = {
